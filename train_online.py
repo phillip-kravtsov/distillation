@@ -40,7 +40,7 @@ from config import TrainingConfig, parse_training_args
 from data import distill, instruct
 from utils import get_checkpoint_dir, get_run_dir
 
-OUTPUT_DIR = "/workspace/monorepo/output"
+OUTPUT_DIR = "/workspace/distillation/output"
 SAVE_SIGNAL_FILE = "/root/should_save"
 CACHE_DIR = "/workspace/.cache"
 MAX_STEPS_TO_KEEP = 3
@@ -715,7 +715,6 @@ def main():
     torch.set_float32_matmul_precision("high")
     torch.set_default_dtype(torch.bfloat16)
     torch.cuda.set_device(local_rank)
-    torch.cuda.set_per_process_memory_fraction(50 / 80)
 
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
     model, tokenizer = load_model(

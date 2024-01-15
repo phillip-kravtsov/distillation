@@ -4,7 +4,9 @@ from typing import List, Optional, Union, get_args, get_origin
 
 @dataclass
 class ModelConfig(object):
-    model_name_or_path: str = field()
+    model_name_or_path: str = field(
+        default="philkrav/tinyllama-1.3b-draft-llama-13b-chat"
+    )
     ddp: bool = field(default=False)
     lora: bool = field(default=False)
     lora_r: int = field(default=32)
@@ -38,7 +40,6 @@ class TrainingConfig(ModelConfig, EvalConfig):
     n_examples: Optional[int] = field(default=None)
     teacher_model: Optional[str] = field(default=None)
     teacher_no_fsdp: bool = field(default=False)
-    compile: bool = field(default=False)
     skip_steps: Optional[int] = field(default=None)
     max_input_seq_len: int = field(default=1024)
     loss: str = field(default="rkl")
