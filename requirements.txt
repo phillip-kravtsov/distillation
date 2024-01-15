@@ -1,0 +1,13 @@
+torch
+transformers
+sentencepiece
+protobuf
+accelerate
+datasets
+wandb
+peft
+tiktoken
+safetensors
+huggingface_hub
+ruff
+matplotlib
