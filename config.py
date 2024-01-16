@@ -42,6 +42,7 @@ class TrainingConfig(ModelConfig, EvalConfig):
     teacher_no_fsdp: bool = field(default=False)
     skip_steps: Optional[int] = field(default=None)
     max_input_seq_len: int = field(default=1024)
+    max_tokens: int = field(default=1024)
     loss: str = field(default="rkl")
 
 

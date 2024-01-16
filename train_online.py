@@ -77,6 +77,7 @@ def distillation_eval(
     prompt_dataloader,
     local_rank,
     online: bool,
+    max_tokens: int,
     max_eval_batches: Optional[int] = None,
 ):
     batch_losses: Dict[str, List[float]] = defaultdict(list)
@@ -91,6 +92,7 @@ def distillation_eval(
                 batch,
                 local_rank=local_rank,
                 include_student_logits=True,
+                max_tokens=max_tokens,
             )
             log_p, log_q = get_online_log_pq(batch, local_rank)
         else:
@@ -101,8 +103,10 @@ def distillation_eval(
             )
         reverse_kl = F.kl_div(log_q, log_p, reduction="batchmean", log_target=True)
         forward_kl = F.kl_div(log_p, log_q, reduction="batchmean", log_target=True)
+        jsd_p_q = jsd(log_p, log_q, 0.5)
         batch_losses["reverse_kl"].append(reverse_kl.cpu().item())
         batch_losses["forward_kl"].append(forward_kl.cpu().item())
+        batch_losses["jsd_p_q"].append(jsd_p_q.cpu().item())
     return {k: sum(v) / len(v) for k, v in batch_losses.items()}
 
 
@@ -168,6 +172,7 @@ def get_online_batch(
     batch: Dict[str, Tensor],
     local_rank,
     include_student_logits=False,
+    max_tokens=1024,
 ) -> Dict[str, Tensor]:
     for k, v in batch.items():
         batch[k] = v.to(f"cuda:{local_rank}")
@@ -178,7 +183,6 @@ def get_online_batch(
         student.gradient_checkpointing_disable()
     student.eval()
     teacher.eval()
-    max_tokens = 1024
     student_logits = []
 
     student_tokens, input_ids = batch["input_ids"], batch["input_ids"]
@@ -218,6 +222,7 @@ def get_online_batch(
         past_key_values = outputs.past_key_values
         attention_mask = None
 
+    gen_tok_s = new_tokens * student_tokens.size(0) / (time.perf_counter() - start)
     if include_student_logits:
         student_logits = torch.cat(student_logits, dim=1)
     student.use_cache = False
@@ -228,6 +233,7 @@ def get_online_batch(
     student.train()
 
     tam = batch["attention_mask"]
+    nonzero_student_tokens = student_tokens.ne(0)
     teacher_attention_mask = torch.cat(
         [
             tam,
@@ -235,27 +241,24 @@ def get_online_batch(
         ],
         dim=1,
     )
+    return_attention_mask = teacher_attention_mask & nonzero_student_tokens
     start_teacher = time.perf_counter()
     teacher_logits = teacher(
         input_ids=student_tokens, attention_mask=teacher_attention_mask
-    ).logits.cpu()
-    # TODO: Log these.
+    ).logits
+    # TODO: Log these
+    """
     completed_mean = completed.float().mean().cpu().item()
-    gen_tok_s = new_tokens * student_tokens.size(0) / (time.perf_counter() - start)
     teacher_tok_s = (
         teacher_logits.size(0)
         * teacher_logits.size(1)
         / (time.perf_counter() - start_teacher)
     )
-    if len(student_logits) > 0 and isinstance(student_logits, Tensor):
-        assert teacher_logits.size(0) == student_logits.size(0)
-        assert (
-            teacher_logits.size(1) == student_logits.size(1) + 1
-        ), f"tl {teacher_logits.size()} dl {student_logits.size()}"
+    """
     return_dict = {
         "input_ids": student_tokens,
-        "attention_mask": teacher_attention_mask & input_ids.ne(0),
-        "teacher_logits": teacher_logits.cpu(),  # Save GPU memory as B * S * V can get large
+        "attention_mask": return_attention_mask,
+        "teacher_logits": teacher_logits,  # .cpu(),  # Save GPU memory as B * S * V can get large
     }
     if include_student_logits:
         return_dict["student_logits"] = student_logits
@@ -281,7 +284,7 @@ def get_offline_batch(
     }
 
 
-def save_fsdp_model(step, model, tokenizer, local_rank):
+def save_fsdp_model(step, model, local_rank):
     dist.barrier()
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
@@ -299,7 +302,7 @@ def save_model(step, model, tokenizer, is_lora, local_rank, max_checkpoints=2):
     if local_rank == 0 and is_lora:
         lora.save_lora_model(step, model, tokenizer)
     elif isinstance(model, FSDP):
-        save_fsdp_model(step, model, tokenizer, local_rank)
+        save_fsdp_model(step, model, local_rank)
     elif local_rank == 0 and isinstance(model, DDP):
         model.module.save_pretrained(checkpoint_dir)
     else:
@@ -318,7 +321,7 @@ def save_model(step, model, tokenizer, is_lora, local_rank, max_checkpoints=2):
                 shutil.rmtree(get_checkpoint_dir(step_to_delete))
 
 
-def load_teacher(config: TrainingConfig, local_rank: int):
+def load_teacher(config: TrainingConfig, local_rank: int, world_size: int):
     print("Loading teacher model.")
     teacher_model = AutoModelForCausalLM.from_pretrained(
         config.teacher_model,
@@ -327,7 +330,7 @@ def load_teacher(config: TrainingConfig, local_rank: int):
         device_map=f"cuda:{local_rank}",
     ).eval()
     teacher_model.config.use_cache = False
-    if not config.teacher_no_fsdp:
+    if not config.teacher_no_fsdp and world_size > 1:
         auto_wrap_policy = functools.partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={teacher_model.model.layers[0].__class__},
@@ -489,6 +492,15 @@ def fkl(log_p, log_q):
     )
 
 
+def jsd(log_p: Tensor, log_q: Tensor):
+    beta = 0.5
+    log_m = torch.log(beta * torch.exp(log_p) + (1 - beta) * torch.exp(log_q))
+    return beta * (
+        F.kl_div(log_p, log_m, reduction="batchmean", log_target=True)
+        + (1 - beta) * F.kl_div(log_q, log_m, reduction="batchmean", log_target=True)
+    )
+
+
 class Trainer:
     def __init__(
         self,
@@ -515,6 +527,7 @@ class Trainer:
         self.config = config
         self.local_rank = local_rank
         self.world_size = world_size
+        self.max_tokens = config.max_tokens
         if max_train_steps is not None:
             self.max_train_steps = max_train_steps
         elif config.max_train_steps is not None:
@@ -526,10 +539,16 @@ class Trainer:
         elif config.loss == "fkl":
             self.compute_loss = fkl
         elif config.loss == "jsd":
-            raise NotImplementedError("JSD not implemented")
-            # self.compute_loss = jsd
+            self.compute_loss = jsd
         else:
             raise ValueError(f"Inappropriate loss {config.loss}")
+        self.compute_loss = torch.jit.trace(
+            self.compute_loss,
+            example_inputs=(
+                torch.rand(1, 64, 128),
+                torch.rand(1, 64, 128),
+            ),
+        )
 
     def _init_tracking(self):
         if self.local_rank == 0:
@@ -539,11 +558,16 @@ class Trainer:
             save_config(self.config, wandb.run.name)
 
     def _profile_train_loop(self):
-        self.step = utils.python_profile_function(self.step)
-        with profile(profile_memory=True, record_shapes=True, with_stack=True) as prof:
+        # self.step = utils.python_profile_function(self.step)
+        with profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA],
+            profile_memory=True,
+            record_shapes=True,
+            with_stack=True,
+        ) as prof:
             for batch in tqdm(self.train_dataloader, disable=(self.local_rank != 0)):
                 self.step(batch)
-                if self.completed_steps >= 2:
+                if self.completed_steps >= 1:
                     break
         utils.export_profile(prof, self.local_rank)
 
@@ -614,12 +638,13 @@ class Trainer:
             with self.forward_context:
                 if self.config.task == "online-distillation":
                     batch = get_online_batch(
-                        model,
-                        self.teacher_model,
-                        self.tokenizer,
-                        batch,
+                        student=model,
+                        teacher=self.teacher_model,
+                        tokenizer=self.tokenizer,
+                        batch=batch,
                         local_rank=self.local_rank,
                         include_student_logits=False,
+                        max_tokens=self.max_tokens,
                     )
                 elif self.config.task == "offline-distillation":
                     batch = get_offline_batch(
@@ -631,15 +656,13 @@ class Trainer:
                     raise
                 model.train()
                 teacher_logits = batch.pop("teacher_logits")
-                utils.clear_mem()
                 # since the batch getter is in inference mode
                 for k, v in batch.items():
                     batch[k] = v.clone()
                 draft_logits = model(**batch).logits
-                utils.clear_mem()
 
                 logit_mask = batch["attention_mask"][:, 1:].bool()
-                teacher_logits = teacher_logits.to(self.local_rank)[:, :-1][logit_mask]
+                teacher_logits = teacher_logits[:, :-1][logit_mask]
                 draft_logits = draft_logits[:, :-1][logit_mask]
 
                 loss = self.compute_loss(
@@ -684,6 +707,7 @@ class Trainer:
             tokenizer=self.tokenizer,
             prompt_dataloader=self.val_dataloader,
             local_rank=self.local_rank,
+            max_tokens=self.max_tokens,
             online=self.config.task == "online-distillation",
             max_eval_batches=self.config.max_eval_batches,
         )
@@ -750,7 +774,7 @@ def main():
         model, config.max_train_steps or len(train_dataloader), config
     )
 
-    teacher_model = load_teacher(config, local_rank=local_rank)
+    teacher_model = load_teacher(config, local_rank=local_rank, world_size=world_size)
     trainer = Trainer(
         model=model,
         teacher_model=teacher_model,
