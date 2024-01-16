@@ -27,9 +27,8 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.nn.utils.rnn import pad_sequence
 from torch.profiler import profile
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
@@ -57,16 +56,22 @@ def get_offline_log_pq(student, batch: Dict[str, Tensor]) -> Tuple[Tensor, Tenso
 
 def get_online_log_pq(
     batch: Dict[str, Tensor],
-    local_rank: int,
 ) -> Tuple[Tensor, Tensor]:
     logit_mask = batch["attention_mask"][:, 1:].bool()
     student_logits = batch["student_logits"][logit_mask]
-    teacher_logits = batch["teacher_logits"].to(f"cuda:{local_rank}")[:, :-1][
-        logit_mask
-    ]
+    teacher_logits = batch["teacher_logits"][:, :-1][logit_mask]
     log_p = torch.log_softmax(teacher_logits, dim=-1)
     log_q = torch.log_softmax(student_logits, dim=-1)
     return log_p, log_q
+
+
+@torch.compile()
+def compute_online_losses_eval(batch):
+    log_p, log_q = get_online_log_pq(batch)
+    reverse_kl = F.kl_div(log_q, log_p, reduction="batchmean", log_target=True)
+    forward_kl = F.kl_div(log_p, log_q, reduction="batchmean", log_target=True)
+    jsd_p_q = jsd(log_p, log_q)
+    return reverse_kl, forward_kl, jsd_p_q
 
 
 @torch.inference_mode()
@@ -94,74 +99,18 @@ def distillation_eval(
                 include_student_logits=True,
                 max_tokens=max_tokens,
             )
-            log_p, log_q = get_online_log_pq(batch, local_rank)
+            reverse_kl, forward_kl, jsd_p_q = compute_online_losses_eval(batch)
         else:
             batch = get_offline_batch(teacher, batch, local_rank=local_rank)
-            log_p, log_q = get_offline_log_pq(
-                student,
-                batch,
-            )
-        reverse_kl = F.kl_div(log_q, log_p, reduction="batchmean", log_target=True)
-        forward_kl = F.kl_div(log_p, log_q, reduction="batchmean", log_target=True)
-        jsd_p_q = jsd(log_p, log_q, 0.5)
+            log_p, log_q = get_offline_log_pq(student, batch)
+            reverse_kl = F.kl_div(log_q, log_p, reduction="batchmean", log_target=True)
+            forward_kl = F.kl_div(log_p, log_q, reduction="batchmean", log_target=True)
+            jsd_p_q = jsd(log_p, log_q)
+
         batch_losses["reverse_kl"].append(reverse_kl.cpu().item())
         batch_losses["forward_kl"].append(forward_kl.cpu().item())
         batch_losses["jsd_p_q"].append(jsd_p_q.cpu().item())
     return {k: sum(v) / len(v) for k, v in batch_losses.items()}
-
-
-class OnlineDistillationDataset(Dataset):
-    def __init__(self, examples):
-        self.input_ids = examples["input_ids"]
-        self.attention_mask = [torch.ones_like(ids) for ids in examples["input_ids"]]
-        self.teacher_logits = examples["teacher_logits"]
-        self.student_logits = examples["student_logits"]
-
-    def __len__(self):
-        return len(self.input_ids)
-
-    def __getitem__(self, idx):
-        return {
-            "input_ids": self.input_ids[idx],
-            "attention_mask": self.attention_mask[idx],
-            "teacher_logits": self.teacher_logits[idx],
-            "student_logits": self.student_logits[idx],
-        }
-
-
-class ResumableSampler(Sampler):
-    def __init__(self, data_source: Dataset):
-        self.data_source = data_source
-        self.current_index = 0
-
-    def __iter__(self):
-        self.current_index = max(0, self.current_index - 1)
-        while self.current_index < len(self.data_source):
-            yield self.current_index
-            self.current_index += 1
-
-    def __len__(self):
-        return len(self.data_source)
-
-
-def collate_fn(batch):
-    input_ids = [item["input_ids"] for item in batch]
-    attention_mask = [item["attention_mask"] for item in batch]
-    teacher_logits = [item["teacher_logits"] for item in batch]
-    student_logits = [item["student_logits"] for item in batch]
-
-    # Pad sequences to the maximum length in the batch
-    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
-    teacher_logits = pad_sequence(teacher_logits, batch_first=True, padding_value=0)
-    student_logits = pad_sequence(student_logits, batch_first=True, padding_value=0)
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "teacher_logits": teacher_logits,
-        "student_logits": student_logits,
-    }
 
 
 @torch.inference_mode()
@@ -246,8 +195,8 @@ def get_online_batch(
     teacher_logits = teacher(
         input_ids=student_tokens, attention_mask=teacher_attention_mask
     ).logits
-    # TODO: Log these
     """
+    # TODO: Log these
     completed_mean = completed.float().mean().cpu().item()
     teacher_tok_s = (
         teacher_logits.size(0)
@@ -350,6 +299,8 @@ def load_teacher(config: TrainingConfig, local_rank: int, world_size: int):
                 buffer_dtype=torch.bfloat16,
             ),
         ).eval()
+        if local_rank == 0:
+            print(teacher_model)
     return teacher_model
 
 
@@ -501,6 +452,31 @@ def jsd(log_p: Tensor, log_q: Tensor):
     )
 
 
+# JSD esp is very memory hungry if not compiled
+@torch.compile()
+def compute_jsd_loss(dl, tl, am):
+    logit_mask = am[:, 1:].bool()
+    tl = tl[:, :-1][logit_mask]
+    dl = dl[:, :-1][logit_mask]
+    loss = jsd(
+        torch.log_softmax(tl, dim=-1),
+        torch.log_softmax(dl, dim=-1),
+    )
+    return loss
+
+
+@torch.compile()
+def compute_rkl_loss(dl, tl, am):
+    logit_mask = am[:, 1:].bool()
+    tl = tl[:, :-1][logit_mask]
+    dl = dl[:, :-1][logit_mask]
+    loss = rkl(
+        torch.log_softmax(tl, dim=-1),
+        torch.log_softmax(dl, dim=-1),
+    )
+    return loss
+
+
 class Trainer:
     def __init__(
         self,
@@ -534,21 +510,6 @@ class Trainer:
             self.max_train_steps = config.max_train_steps
         else:
             assert False, "Must specify max train steps."
-        if config.loss == "rkl":
-            self.compute_loss = rkl
-        elif config.loss == "fkl":
-            self.compute_loss = fkl
-        elif config.loss == "jsd":
-            self.compute_loss = jsd
-        else:
-            raise ValueError(f"Inappropriate loss {config.loss}")
-        self.compute_loss = torch.jit.trace(
-            self.compute_loss,
-            example_inputs=(
-                torch.rand(1, 64, 128),
-                torch.rand(1, 64, 128),
-            ),
-        )
 
     def _init_tracking(self):
         if self.local_rank == 0:
@@ -655,20 +616,24 @@ class Trainer:
                 else:
                     raise
                 model.train()
-                teacher_logits = batch.pop("teacher_logits")
+                teacher_logits = batch.pop("teacher_logits").clone()
                 # since the batch getter is in inference mode
                 for k, v in batch.items():
                     batch[k] = v.clone()
                 draft_logits = model(**batch).logits
 
-                logit_mask = batch["attention_mask"][:, 1:].bool()
-                teacher_logits = teacher_logits[:, :-1][logit_mask]
-                draft_logits = draft_logits[:, :-1][logit_mask]
+                attention_mask = batch["attention_mask"]
+                if self.config.loss == "jsd":
+                    loss = compute_jsd_loss(
+                        draft_logits, teacher_logits, attention_mask
+                    )
+                elif self.config.loss == "rkl":
+                    loss = compute_rkl_loss(
+                        draft_logits, teacher_logits, attention_mask
+                    )
+                else:
+                    raise ValueError(f"Inappropriate loss {self.config.loss}")
 
-                loss = self.compute_loss(
-                    torch.log_softmax(teacher_logits, dim=-1),
-                    torch.log_softmax(draft_logits, dim=-1),
-                )
                 log[self.config.loss] = promote_scalar(loss.detach())
             loss.backward()
             dist.barrier()
